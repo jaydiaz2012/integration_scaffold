@@ -1,96 +1,99 @@
 # workers.py
+# Updated to allow direct invocation from event webhooks
+# Synchronous Discord adapter, 10-tier membership logic, temporary access handling
 
-import time
-from typing import Dict, Any, List
+from datetime import datetime, timedelta
+from threading import Thread
+import queue
+
+from models import AutomationRule, UserTier, EventLog
 from adapters import DiscordAdapter
+from utils import logger, with_idempotency
+
+# Worker queue
+task_queue = queue.Queue()
+
+discord = DiscordAdapter()
 
 
-class EntitlementWorker:
-    """
-    Handles:
-      - New purchase access
-      - Tier upgrades/downgrades
-      - Expiry enforcement
-      - Multi-guild distribution
-      - Discord invite generation
-      - Event logging
+def enqueue_task(task):
+    task_queue.put(task)
 
-    This worker is intentionally synchronous so it can run inside
-    a background process, cron, or webhook handler.
-    """
 
-    def __init__(
-        self,
-        discord_adapter: DiscordAdapter,
-        managed_guilds: List[str],
-        logger=None
-    ):
-        self.discord = discord_adapter
-        self.managed_guilds = managed_guilds
-        self.logger = logger or print  # simple default logger
+def worker_loop():
+    while True:
+        task = task_queue.get()
+        if task is None:
+            break
+        try:
+            process_task(task)
+        except Exception as e:
+            logger.error(f"Worker error: {e}")
+        finally:
+            task_queue.task_done()
 
-    # -------------------------------------------------------------
-    # MAIN ENTRY POINT
-    # -------------------------------------------------------------
-    def process_entitlement(
-        self,
-        user_id: str,
-        tier_name: str,
-        temporary: bool = True
-    ) -> Dict[str, Any]:
-        """
-        Applies the correct tier across ALL managed guilds.
-        Calls expiry cleanup before reassigning.
-        """
 
-        overall = {
-            "user_id": user_id,
-            "tier": tier_name,
-            "guild_results": {}
-        }
+worker_thread = Thread(target=worker_loop, daemon=True)
+worker_thread.start()
 
-        for guild_id in self.managed_guilds:
 
-            self.logger(f"[EntitlementWorker] Processing {user_id} in guild {guild_id}")
+@with_idempotency
+def process_task(task):
+    event_type = task.get("event_type")
+    user_id = task.get("user_id")
+    tiers = task.get("tiers", [])
+    guild_id = task.get("guild_id")
+    timestamp = datetime.utcnow()
 
-            # --- Step 1: enforce expiry before anything else ---
-            expired_removed = self.discord.enforce_expiry(guild_id, user_id)
+    EventLog.create(event_type=event_type, user_id=user_id, payload=task)
 
-            # --- Step 2: assign tier (adds new, removes old) ---
-            tier_result = self.discord.assign_tier(
-                guild_id=guild_id,
-                user_id=user_id,
-                tier_name=tier_name,
-                temporary=temporary
-            )
+    if event_type == "purchase":
+        handle_purchase(user_id, tiers, guild_id, timestamp)
 
-            # --- Step 3: generate invite only if user not in guild ---
-            invite_url = None
-            if not self.discord.is_member(guild_id, user_id):
-                # You may want to define a welcome channel mapping per guild
-                welcome_channel = self._default_welcome_channel(guild_id)
-                invite_url = self.discord.create_invite(
-                    channel_id=welcome_channel,
-                    max_uses=1,
-                    expires_in_seconds=3600
-                )
-                self.logger(f"[EntitlementWorker] Created invite for {user_id}: {invite_url}")
+    elif event_type == "cancel":
+        handle_cancel(user_id, tiers, guild_id)
 
-            # store per-guild results
-            overall["guild_results"][guild_id] = {
-                "expired_removed": expired_removed,
-                "tier_assignment": tier_result,
-                "invite": invite_url
-            }
+    elif event_type == "renewal":
+        handle_renewal(user_id, tiers, guild_id)
 
-        return overall
 
-    # -------------------------------------------------------------
-    # EXTERNAL SCHEDULED CLEANUP (for auto-expiry)
-    # -------------------------------------------------------------
-    def cleanup_expired_access(self) -> Dict[str, Any]:
-        """
-        Iterates through all guilds + all expiry keys inside
-        the discord adapter storage and removes expired roles.
+###############################################
+# HANDLERS
+###############################################
 
-        Ideal for a CRON job: runs every 10
+def handle_purchase(user_id, tiers, guild_id, timestamp):
+    for tier in tiers:
+        UserTier.grant(user_id, tier)
+
+        role_id = discord.get_role_for_tier(guild_id, tier)
+        if role_id:
+            discord.assign_role(guild_id, user_id, role_id)
+
+    # Temporary access logic: apply Tier 1 for +5 days
+    temporary_until = timestamp + timedelta(days=5)
+    UserTier.grant(user_id, "temporary_tier_1", expires_at=temporary_until)
+
+    temp_role = discord.get_role_for_tier(guild_id, "temporary_tier_1")
+    if temp_role:
+        discord.assign_role(guild_id, user_id, temp_role)
+
+    logger.info(f"Purchase handled for {user_id} in guild {guild_id}")
+
+
+def handle_cancel(user_id, tiers, guild_id):
+    for tier in tiers:
+        UserTier.revoke(user_id, tier)
+
+        role_id = discord.get_role_for_tier(guild_id, tier)
+        if role_id:
+            discord.remove_role(guild_id, user_id, role_id)
+
+    logger.info(f"Cancel handled for {user_id} in guild {guild_id}")
+
+
+def handle_renewal(user_id, tiers, guild_id):
+    for tier in tiers:
+        UserTier.extend(user_id, tier, days=30)
+
+    logger.info(f"Renewal handled for {user_id} in guild {guild_id}")
+
