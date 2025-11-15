@@ -1,4 +1,4 @@
-Integration Blueprint ? Whop / Discord / Shopify (Python)
+Integration Blueprint in Discord (Python)
 
 Overview
 --------
